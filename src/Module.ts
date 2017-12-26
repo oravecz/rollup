@@ -497,30 +497,6 @@ export default class Module {
 		return addedNewNodes;
 	}
 
-	replaceDynamicImports () {
-		this.dynamicImportResolutions.forEach((replacement, index) => {
-			const node = this.dynamicImports[index];
-
-			if (!replacement)
-				return;
-
-			// string specifier -> direct resolution
-			// if we have the module, inline as Promise.resolve(namespace)
-			// ensuring that we create a namespace import of it as well
-			if (replacement instanceof Module) {
-				const namespace = replacement.namespace();
-				const identifierName = namespace.getName(true);
-				this.magicString.overwrite(node.parent.start, node.parent.end, `Promise.resolve( ${identifierName} )`);
-			// external dynamic import resolution
-			} else if (replacement instanceof ExternalModule) {
-				this.magicString.overwrite(node.parent.arguments[0].start, node.parent.arguments[0].end, `"${replacement.id}"`);
-			// AST Node -> source replacement
-			} else {
-				this.magicString.overwrite(node.parent.arguments[0].start, node.parent.arguments[0].end, replacement);
-			}
-		});
-	}
-
 	namespace (): NamespaceVariable {
 		if (!this.declarations['*']) {
 			this.declarations['*'] = new NamespaceVariable(this);
@@ -529,7 +505,7 @@ export default class Module {
 		return this.declarations['*'];
 	}
 
-	render (es: boolean, legacy: boolean, freeze: boolean) {
+	render (es: boolean, legacy: boolean, freeze: boolean): MagicString {
 		const magicString = this.magicString.clone();
 
 		for (const node of this.ast.body) {
