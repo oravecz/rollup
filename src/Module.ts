@@ -18,7 +18,7 @@ import ModuleScope from './ast/scopes/ModuleScope';
 import { encode } from 'sourcemap-codec';
 import { RawSourceMap, SourceMapConsumer } from 'source-map';
 import ImportSpecifier from './ast/nodes/ImportSpecifier';
-import Graph, { ResolveDynamicImportHandler } from './Graph';
+import Graph from './Graph';
 import Variable from './ast/variables/Variable';
 import Program from './ast/nodes/Program';
 import VariableDeclarator from './ast/nodes/VariableDeclarator';
@@ -34,8 +34,6 @@ import ImportNamespaceSpecifier from './ast/nodes/ImportNamespaceSpecifier';
 import { RollupWarning } from './rollup/index';
 import ExternalModule from './ExternalModule';
 import Import from './ast/nodes/Import';
-import TemplateLiteral from './ast/nodes/TemplateLiteral';
-import Literal from './ast/nodes/Literal';
 
 const setModuleDynamicImportsReturnBinding = wrapDynamicImportPlugin(acorn);
 
@@ -88,7 +86,7 @@ export default class Module {
 	code: string;
 	comments: CommentDescription[];
 	context: string;
-	dependencies: (Module | ExternalModule)[];
+	dependencies: Module[];
 	excludeFromSourcemap: boolean;
 	exports: { [name: string]: ExportDescription };
 	exportsAll: { [name: string]: string };
@@ -103,7 +101,7 @@ export default class Module {
 			module: Module | ExternalModule | null;
 		}
 	};
-	isExternal: boolean;
+	isExternal: false;
 	magicString: MagicString;
 	originalCode: string;
 	originalSourcemap: RawSourceMap;
@@ -114,6 +112,8 @@ export default class Module {
 	sourcemapChain: RawSourceMap[];
 	sources: string[];
 	strongDependencies: (Module | ExternalModule)[];
+	dynamicImports: Import[];
+	dynamicImportResolutions: (Module | ExternalModule | string | void)[];
 
 	ast: Program;
 	private astClone: Program;
@@ -122,7 +122,6 @@ export default class Module {
 		[name: string]: Variable;
 	};
 	private exportAllModules: (Module | ExternalModule)[];
-	private dynamicImports: Import[];
 
 	constructor ({
 		id,
@@ -153,6 +152,7 @@ export default class Module {
 		this.sourcemapChain = sourcemapChain;
 		this.comments = [];
 		this.dynamicImports = [];
+		this.dynamicImportResolutions = [];
 
 		timeStart('ast');
 
@@ -391,7 +391,7 @@ export default class Module {
 
 			if (id) {
 				const module = this.graph.moduleById.get(id);
-				this.dependencies.push(module);
+				this.dependencies.push(<Module>module);
 			}
 		});
 	}
@@ -497,47 +497,28 @@ export default class Module {
 		return addedNewNodes;
 	}
 
-	processDynamicImports (resolveDynamicImport: ResolveDynamicImportHandler) {
-		return Promise.all(this.dynamicImports.map(node => {
-			const importArgument = <Node>node.parent.arguments[0];
-			let dynamicImportSpecifier: string | Node;
-			if (importArgument.type === 'TemplateLiteral') {
-				if ((<TemplateLiteral>importArgument).expressions.length === 0 && (<TemplateLiteral>importArgument).quasis.length === 1) {
-					dynamicImportSpecifier = (<TemplateLiteral>importArgument).quasis[0].value.cooked;
-				}
-			} else if (importArgument.type === 'Literal') {
-				if (typeof (<Literal>importArgument).value === 'string') {
-					dynamicImportSpecifier = <string>(<Literal>importArgument).value;
-				}
+	replaceDynamicImports () {
+		this.dynamicImportResolutions.forEach((replacement, index) => {
+			const node = this.dynamicImports[index];
+
+			if (!replacement)
+				return;
+
+			// string specifier -> direct resolution
+			// if we have the module, inline as Promise.resolve(namespace)
+			// ensuring that we create a namespace import of it as well
+			if (replacement instanceof Module) {
+				const namespace = replacement.namespace();
+				const identifierName = namespace.getName(true);
+				this.magicString.overwrite(node.parent.start, node.parent.end, `Promise.resolve( ${identifierName} )`);
+			// external dynamic import resolution
+			} else if (replacement instanceof ExternalModule) {
+				this.magicString.overwrite(node.parent.arguments[0].start, node.parent.arguments[0].end, `"${replacement.id}"`);
+			// AST Node -> source replacement
 			} else {
-				dynamicImportSpecifier = importArgument;
+				this.magicString.overwrite(node.parent.arguments[0].start, node.parent.arguments[0].end, replacement);
 			}
-
-			return Promise.resolve(resolveDynamicImport(dynamicImportSpecifier, this.id))
-				.then(replacement => {
-					if (!replacement)
-						return;
-
-					// string specifier -> direct resolution
-					if (typeof dynamicImportSpecifier === 'string') {
-						// if we have the module, inline as Promise.resolve(namespace)
-						// ensuring that we create a namespace import of it as well
-						const replacementModule = this.graph.moduleById.get(replacement);
-						if (replacementModule && !replacementModule.isExternal) {
-							const namespace = (<Module>replacementModule).namespace();
-							namespace.includeVariable();
-							const identifierName = namespace.getName(true);
-							this.magicString.overwrite(node.parent.start, node.parent.end, `Promise.resolve( ${identifierName} )`);
-							// otherwise treat as an external dynamic import resolution
-						} else {
-							this.magicString.overwrite(importArgument.start, importArgument.end, `"${replacement}"`);
-						}
-						// AST Node -> source replacement
-					} else {
-						this.magicString.overwrite(importArgument.start, importArgument.end, replacement);
-					}
-				});
-		}));
+		});
 	}
 
 	namespace (): NamespaceVariable {
