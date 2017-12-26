@@ -21,6 +21,8 @@ import Program from './ast/nodes/Program';
 import Node from './ast/Node';
 import Bundle from './Bundle';
 import ExportDefaultVariable from './ast/variables/ExportDefaultVariable';
+import TemplateLiteral from './ast/nodes/TemplateLiteral';
+import Literal from './ast/nodes/Literal';
 
 export type ResolveDynamicImportHandler = (specifier: string | Node, parentId: string) => Promise<string | void>;
 
@@ -149,7 +151,10 @@ export default class Graph {
 		this.dynamicImport = typeof options.experimentalDynamicImport === 'boolean' ? options.experimentalDynamicImport : false;
 
 		if (this.dynamicImport) {
-			this.resolveDynamicImport = first(this.plugins.map(plugin => plugin.resolveDynamicImport).filter(Boolean));
+			this.resolveDynamicImport = first([
+				...this.plugins.map(plugin => plugin.resolveDynamicImport).filter(Boolean),
+				<ResolveDynamicImportHandler> ((specifier, parentId) => typeof specifier === 'string' && this.resolveId(specifier, parentId))
+			]);
 			this.acornOptions.plugins = this.acornOptions.plugins || {};
 			this.acornOptions.plugins.dynamicImport = true;
 		}
@@ -216,6 +221,7 @@ export default class Graph {
 	buildSingle (entryModuleId: string): Promise<Bundle> {
 		let entryModule: Module;
 		let orderedModules: Module[];
+		let dynamicImports: Module[];
 
 		// Phase 1 – discovery. We load the entry module and find which
 		// modules it imports, and import those, until we have all
@@ -232,20 +238,19 @@ export default class Graph {
 				timeStart('phase 2');
 
 				this.link();
-				orderedModules = this.analyseExecution(entryModule);
+				({ orderedModules, dynamicImports } = this.analyseExecution(entryModule));
 
 				timeEnd('phase 2');
 
 				// Phase 3 – marking. We include all statements that should be included
 				timeStart('phase 3');
 
-				// hook dynamic imports
-				if (this.dynamicImport)
-					return Promise.all(this.modules.map(module => module.processDynamicImports(this.resolveDynamicImport)));
-			})
-			.then(() => {
-				// mark all export statements
+				// mark all export statements for the entry module and dynamic import modules
 				this.mark(entryModule);
+				dynamicImports.forEach(dynamicImportModule => {
+					this.mark(dynamicImportModule);
+					dynamicImportModule.namespace().includeVariable();
+				});
 
 				// check for unused external imports
 				this.externalModules.forEach(module => {
@@ -289,6 +294,11 @@ export default class Graph {
 				timeStart('phase 4');
 
 				this.deconflict(externalModules);
+				// inline dynamic imports
+				this.modules.forEach(module => {
+					module.replaceDynamicImports();
+				});
+
 				const bundle = new Bundle(this, orderedModules, externalModules, entryModule);
 
 				timeEnd('phase 4');
@@ -337,31 +347,45 @@ export default class Graph {
 		}
 	}
 
-	private analyseExecution (entryModule: Module): Module[] {
-		let hasCycles;
-		const seen: { [id: string]: boolean } = {};
+	private analyseExecution (entryModule: Module) {
+		let hasCycles = false, curEntry: Module;
+		const seen: { [id: string]: Module } = {};
 		const ordered: Module[] = [];
 
+		const dynamicImports: Module[] = [];
+
 		function visit (module: Module) {
-			if (seen[module.id]) {
-				hasCycles = true;
+			const seenEntry = seen[module.id];
+			if (seenEntry) {
+				if (seenEntry === curEntry)
+					hasCycles = true;
 				return;
 			}
 
-			seen[module.id] = true;
+			seen[module.id] = curEntry;
 
 			module.dependencies.forEach(visit);
+			module.dynamicImportResolutions.forEach(module => {
+				if (module instanceof Module)
+					dynamicImports.push(module);
+			});
 
 			ordered.push(module);
 		}
 
+		curEntry = entryModule;
 		visit(entryModule);
+
+		for (let i = 0; i < dynamicImports.length; i++) {
+			curEntry = dynamicImports[i];
+			visit(curEntry);
+		}
 
 		if (hasCycles) {
 			this.warnCycle(ordered, [entryModule]);
 		}
 
-		return ordered;
+		return { orderedModules: ordered, dynamicImports };
 	}
 
 	private warnCycle (ordered: Module[], entryModules: Module[]) {
@@ -453,7 +477,12 @@ export default class Graph {
 
 	private fetchModule (id: string, importer: string): Promise<Module> {
 		// short-circuit cycles
-		if (this.moduleById.has(id)) return null;
+		const existingModule = this.moduleById.get(id);
+		if (existingModule) {
+			if (existingModule.isExternal)
+				throw new Error(`Cannot fetch external module ${id}`);
+			return Promise.resolve(<Module>existingModule);
+		}
 		this.moduleById.set(id, null);
 
 		return this.load(id)
@@ -563,6 +592,57 @@ export default class Graph {
 	}
 
 	private fetchAllDependencies (module: Module) {
+		// resolve and fetch dynamic imports where possible
+		const fetchDynamicImportsPromise = Promise.all(module.dynamicImports.map((node, index) => {
+			const importArgument = node.parent.arguments[0];
+			let dynamicImportSpecifier: string | Node;
+			if (importArgument.type === 'TemplateLiteral') {
+				if ((<TemplateLiteral>importArgument).expressions.length === 0 && (<TemplateLiteral>importArgument).quasis.length === 1) {
+					dynamicImportSpecifier = (<TemplateLiteral>importArgument).quasis[0].value.cooked;
+				}
+			} else if (importArgument.type === 'Literal') {
+				if (typeof (<Literal>importArgument).value === 'string') {
+					dynamicImportSpecifier = (<Literal<string>>importArgument).value;
+				}
+			} else {
+				dynamicImportSpecifier = importArgument;
+			}
+
+			return Promise.resolve(this.resolveDynamicImport(dynamicImportSpecifier, module.id))
+			.then(replacement => {
+				if (!replacement) {
+					module.dynamicImportResolutions[index] = null;
+					return;
+				}
+
+				if (typeof dynamicImportSpecifier !== 'string') {
+					module.dynamicImportResolutions[index] = replacement;
+					return;
+				}
+
+				// add dynamic import to the graph
+				if (this.isExternal(replacement, module.id, true)) {
+					if (!this.moduleById.has(replacement)) {
+						const module = new ExternalModule(replacement);
+						this.externalModules.push(module);
+						this.moduleById.set(replacement, module);
+					}
+
+					const externalModule = <ExternalModule>this.moduleById.get(replacement);
+					module.dynamicImportResolutions[index] = externalModule;
+					externalModule.exportsNamespace = true;
+					return;
+				}
+
+				return this.fetchModule(replacement, module.id)
+				.then(depModule => {
+					module.dynamicImportResolutions[index] = depModule;
+					return;
+				});
+			});
+		}));
+		fetchDynamicImportsPromise.catch(() => {});
+
 		return mapSequence(module.sources, source => {
 			const resolvedId = module.resolvedIds[source];
 			return (resolvedId
@@ -620,6 +700,9 @@ export default class Graph {
 					return this.fetchModule(<string>resolvedId, module.id);
 				}
 			});
+		})
+		.then(() => {
+			return fetchDynamicImportsPromise;
 		});
 	}
 
