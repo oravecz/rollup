@@ -294,10 +294,6 @@ export default class Graph {
 				timeStart('phase 4');
 
 				this.deconflict(externalModules);
-				// inline dynamic imports
-				this.modules.forEach(module => {
-					module.replaceDynamicImports();
-				});
 
 				const bundle = new Bundle(this, orderedModules, externalModules, entryModule);
 
