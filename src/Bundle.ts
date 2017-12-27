@@ -2,7 +2,7 @@ import { timeStart, timeEnd } from './utils/flushTime';
 import { decode } from 'sourcemap-codec';
 import { Bundle as MagicStringBundle } from 'magic-string';
 import { find } from './utils/array';
-import { keys } from './utils/object';
+import { keys, blank, forOwn } from './utils/object';
 import Module from './Module';
 import finalisers from './finalisers/index';
 import getExportMode from './utils/getExportMode';
@@ -24,10 +24,11 @@ import { OutputOptions } from './rollup/index';
 import { RawSourceMap } from 'source-map';
 import Graph from './Graph';
 import ExternalModule from './ExternalModule';
+import ExternalVariable from './ast/variables/ExternalVariable';
+import ExportDefaultVariable from './ast/variables/ExportDefaultVariable';
 
 export default class Bundle {
 	graph: Graph;
-	modules: Module[];
 	orderedModules: Module[];
 	externalModules: ExternalModule[];
 	entryModule: Module;
@@ -80,6 +81,54 @@ export default class Bundle {
 		}
 
 		return resolvedId;
+	}
+
+	deconflict () {
+		const used = blank();
+
+		// ensure no conflicts with globals
+		keys(this.graph.scope.variables).forEach(name => (used[name] = 1));
+
+		function getSafeName (name: string): string {
+			while (used[name]) {
+				name += `$${used[name]++}`;
+			}
+
+			used[name] = 1;
+			return name;
+		}
+
+		const toDeshadow: Set<string> = new Set();
+
+		this.externalModules.forEach(module => {
+			const safeName = getSafeName(module.name);
+			toDeshadow.add(safeName);
+			module.name = safeName;
+
+			// ensure we don't shadow named external imports, if
+			// we're creating an ES6 bundle
+			forOwn(module.declarations, (declaration, name) => {
+				const safeName = getSafeName(name);
+				toDeshadow.add(safeName);
+				(<ExternalVariable>declaration).setSafeName(safeName);
+			});
+		});
+
+		this.orderedModules.forEach(module => {
+			forOwn(module.scope.variables, variable => {
+				if (!(<ExportDefaultVariable>variable).isDefault || !(<ExportDefaultVariable>variable).hasId) {
+					variable.name = getSafeName(variable.name);
+				}
+			});
+
+			// deconflict reified namespaces
+			const namespace = module.namespace();
+			if (namespace.needsNamespaceBlock) {
+				namespace.name = getSafeName(namespace.name);
+			}
+		});
+
+		this.graph.scope.deshadow(toDeshadow);
 	}
 
 	render (options: OutputOptions) {

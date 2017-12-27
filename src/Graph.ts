@@ -1,6 +1,6 @@
 import { timeStart, timeEnd } from './utils/flushTime';
 import first from './utils/first';
-import { keys, blank, forOwn } from './utils/object';
+import { keys, blank } from './utils/object';
 import Module, { IdMap, ModuleJSON } from './Module';
 import ExternalModule from './ExternalModule';
 import ensureArray from './utils/ensureArray';
@@ -20,7 +20,6 @@ import { RawSourceMap } from 'source-map';
 import Program from './ast/nodes/Program';
 import Node from './ast/Node';
 import Bundle from './Bundle';
-import ExportDefaultVariable from './ast/variables/ExportDefaultVariable';
 import TemplateLiteral from './ast/nodes/TemplateLiteral';
 import Literal from './ast/nodes/Literal';
 
@@ -293,9 +292,8 @@ export default class Graph {
 
 				timeStart('phase 4');
 
-				this.deconflict(externalModules);
-
 				const bundle = new Bundle(this, orderedModules, externalModules, entryModule);
+				bundle.deconflict();
 
 				timeEnd('phase 4');
 
@@ -421,54 +419,6 @@ export default class Graph {
 				}
 			}
 		});
-	}
-
-	private deconflict (externalModules: ExternalModule[]) {
-		const used = blank();
-
-		// ensure no conflicts with globals
-		keys(this.scope.variables).forEach(name => (used[name] = 1));
-
-		function getSafeName (name: string): string {
-			while (used[name]) {
-				name += `$${used[name]++}`;
-			}
-
-			used[name] = 1;
-			return name;
-		}
-
-		const toDeshadow: Set<string> = new Set();
-
-		externalModules.forEach(module => {
-			const safeName = getSafeName(module.name);
-			toDeshadow.add(safeName);
-			module.name = safeName;
-
-			// ensure we don't shadow named external imports, if
-			// we're creating an ES6 bundle
-			forOwn(module.declarations, (declaration, name) => {
-				const safeName = getSafeName(name);
-				toDeshadow.add(safeName);
-				(<ExternalVariable>declaration).setSafeName(safeName);
-			});
-		});
-
-		this.modules.forEach(module => {
-			forOwn(module.scope.variables, variable => {
-				if (!(<ExportDefaultVariable>variable).isDefault || !(<ExportDefaultVariable>variable).hasId) {
-					variable.name = getSafeName(variable.name);
-				}
-			});
-
-			// deconflict reified namespaces
-			const namespace = module.namespace();
-			if (namespace.needsNamespaceBlock) {
-				namespace.name = getSafeName(namespace.name);
-			}
-		});
-
-		this.scope.deshadow(toDeshadow);
 	}
 
 	private fetchModule (id: string, importer: string): Promise<Module> {
