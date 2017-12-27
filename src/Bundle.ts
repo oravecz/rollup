@@ -26,18 +26,27 @@ import Graph from './Graph';
 import ExternalModule from './ExternalModule';
 import ExternalVariable from './ast/variables/ExternalVariable';
 import ExportDefaultVariable from './ast/variables/ExportDefaultVariable';
+import ChunkFascadeModule from './ChunkFascadeModule';
+import Scope from './ast/scopes/Scope';
 
 export default class Bundle {
 	graph: Graph;
 	orderedModules: Module[];
 	externalModules: ExternalModule[];
-	entryModule: Module;
+	entryModule: Module | ChunkFascadeModule;
+	scope: Scope;
 
-	constructor (graph: Graph, orderedModules: Module[], externalModules: ExternalModule[], entryModule: Module) {
+	constructor (graph: Graph, orderedModules: Module[], externalModules: ExternalModule[], entryModule: Module | ChunkFascadeModule) {
 		this.graph = graph;
 		this.orderedModules = orderedModules;
 		this.externalModules = externalModules;
 		this.entryModule = entryModule;
+
+		// special scope created for bundle deshadowing
+		this.scope = new Scope({ parent: this.graph.scope });
+		orderedModules.forEach(module => {
+			this.scope.children.push(module.scope);
+		});
 	}
 
 	collectAddon (initialAddon: string, addonName: 'banner' | 'footer' | 'intro' | 'outro', sep: string = '\n') {
@@ -128,7 +137,7 @@ export default class Bundle {
 			}
 		});
 
-		this.graph.scope.deshadow(toDeshadow);
+		this.scope.deshadow(toDeshadow);
 	}
 
 	render (options: OutputOptions) {
@@ -164,12 +173,18 @@ export default class Bundle {
 							return;
 
 						// string specifier -> direct resolution
-						// if we have the module, inline as Promise.resolve(namespace)
-						// ensuring that we create a namespace import of it as well
 						if (replacement instanceof Module) {
-							const namespace = replacement.namespace();
-							const identifierName = namespace.getName(true);
-							source.overwrite(node.parent.start, node.parent.end, `Promise.resolve( ${identifierName} )`);
+							// if we have the module in the bundle, inline as Promise.resolve(namespace)
+							// ensuring that we create a namespace import of it as well
+							if (!replacement.chunk || replacement.chunk.bundle === this) {
+								const namespace = replacement.namespace();
+								namespace.includeVariable();
+								const identifierName = namespace.getName(true);
+								source.overwrite(node.parent.start, node.parent.end, `Promise.resolve( ${identifierName} )`);
+							// for the module in another chunk, import that other chunk directly
+							} else {
+								source.overwrite(node.parent.arguments[0].start, node.parent.arguments[0].end, `"./${replacement.chunk.fileName}"`);
+							}
 						// external dynamic import resolution
 						} else if (replacement instanceof ExternalModule) {
 							source.overwrite(node.parent.arguments[0].start, node.parent.arguments[0].end, `"${replacement.id}"`);

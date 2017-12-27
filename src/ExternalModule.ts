@@ -4,11 +4,11 @@ import ExternalVariable from './ast/variables/ExternalVariable';
 import Variable from './ast/variables/Variable';
 
 export default class ExternalModule {
-	declarations: {[name: string]: Variable};
+	declarations: {[name: string]: ExternalVariable};
 	exportsNames: boolean;
 	exportsNamespace: boolean;
 	id: string;
-	isExternal: boolean;
+	isExternal: true;
 	name: string;
 	mostCommonSuggestion: number;
 	nameSuggestions: {[name: string]: number};

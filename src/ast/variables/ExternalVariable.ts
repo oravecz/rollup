@@ -1,14 +1,15 @@
 import Variable from './Variable';
 import Identifier from '../nodes/Identifier';
 import ExternalModule from '../../ExternalModule';
+import ChunkFascadeModule from '../../ChunkFascadeModule';
 
 export default class ExternalVariable extends Variable {
-	module: ExternalModule;
+	module: ExternalModule | ChunkFascadeModule;
 	safeName: string;
 	isExternal: true;
 	isNamespace: boolean;
 
-	constructor (module: ExternalModule, name: string) {
+	constructor (module: ExternalModule | ChunkFascadeModule, name: string) {
 		super(name);
 		this.module = module;
 		this.safeName = null;
@@ -18,22 +19,24 @@ export default class ExternalVariable extends Variable {
 
 	addReference (identifier: Identifier) {
 		if (this.name === 'default' || this.name === '*') {
-			this.module.suggestName(identifier.name);
+			(<ExternalModule>this.module).suggestName(identifier.name);
 		}
 	}
 
 	getName (es: boolean) {
+		const module = <ExternalModule>this.module;
+
 		if (this.name === '*') {
-			return this.module.name;
+			return module.name;
 		}
 
 		if (this.name === 'default') {
-			return this.module.exportsNamespace || (!es && this.module.exportsNames)
-				? `${this.module.name}__default`
-				: this.module.name;
+			return module.exportsNamespace || (!es && module.exportsNames)
+				? `${module.name}__default`
+				: module.name;
 		}
 
-		return es ? this.safeName : `${this.module.name}.${this.name}`;
+		return es ? this.safeName : `${module.name}.${this.name}`;
 	}
 
 	includeVariable () {

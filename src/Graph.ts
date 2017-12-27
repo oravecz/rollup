@@ -1,3 +1,4 @@
+/// <reference path="./Graph.d.ts" />
 import { timeStart, timeEnd } from './utils/flushTime';
 import first from './utils/first';
 import { keys, blank } from './utils/object';
@@ -22,6 +23,18 @@ import Node from './ast/Node';
 import Bundle from './Bundle';
 import TemplateLiteral from './ast/nodes/TemplateLiteral';
 import Literal from './ast/nodes/Literal';
+import xor from 'buffer-xor';
+import * as crypto from 'crypto';
+import path from 'path';
+import ChunkFascadeModule from './ChunkFascadeModule';
+
+export interface Chunk {
+	bundle: Bundle;
+	entryPoint: Module | void;
+	fileName: string,
+	modules: Module[],
+	exposedModules: Module[]
+};
 
 export type ResolveDynamicImportHandler = (specifier: string | Node, parentId: string) => Promise<string | void>;
 
@@ -218,17 +231,12 @@ export default class Graph {
 	}
 
 	buildSingle (entryModuleId: string): Promise<Bundle> {
-		let entryModule: Module;
-		let orderedModules: Module[];
-		let dynamicImports: Module[];
-
 		// Phase 1 – discovery. We load the entry module and find which
 		// modules it imports, and import those, until we have all
 		// of the entry module's dependencies
 		timeStart('phase 1');
 		return this.loadModule(entryModuleId)
-			.then((_entryModule) => {
-				entryModule = _entryModule;
+			.then(entryModule => {
 				timeEnd('phase 1');
 
 				// Phase 2 - linking. We populate the module dependency links
@@ -237,7 +245,7 @@ export default class Graph {
 				timeStart('phase 2');
 
 				this.link();
-				({ orderedModules, dynamicImports } = this.analyseExecution(entryModule));
+				const { orderedModules, dynamicImports } = this.analyseExecution([entryModule]);
 
 				timeEnd('phase 2');
 
@@ -288,7 +296,7 @@ export default class Graph {
 
 				timeEnd('phase 3');
 
-				// Phase 4 – we ensure that names are deconflicted throughout the bundle
+				// Phase 4 – we ensure that names are deconflicted throughout all bundles
 
 				timeStart('phase 4');
 
@@ -298,6 +306,239 @@ export default class Graph {
 				timeEnd('phase 4');
 
 				return bundle;
+			});
+	}
+
+	buildChunks (entryModuleIds: string[]): Promise<{ [name: string]: Bundle }> {
+		// Phase 1 – discovery. We load the entry module and find which
+		// modules it imports, and import those, until we have all
+		// of the entry module's dependencies
+		timeStart('phase 1');
+		return Promise.all(entryModuleIds.map(entryId => this.loadModule(entryId)))
+			.then(entryModules => {
+				timeEnd('phase 1');
+
+				// Phase 2 - linking. We populate the module dependency links
+				// including linking binding references between modules. We also
+				// determine the topological execution order for the bundle
+				// as well as computing the automated chunking graph colouring.
+				timeStart('phase 2');
+
+				this.link();
+				const { orderedModules, dynamicImports } = this.analyseExecution(entryModules);
+
+				timeEnd('phase 2');
+
+				// Phase 3 – marking. We include all statements that should be included
+				timeStart('phase 3');
+
+				// mark all export statements for the entry module and dynamic import modules
+				for (let entryModule of entryModules)
+					this.mark(entryModule);
+				dynamicImports.forEach(dynamicImportModule => {
+					this.mark(dynamicImportModule);
+				});
+
+				// check for unused external imports
+				this.externalModules.forEach(module => {
+					const unused = Object.keys(module.declarations)
+						.filter(name => name !== '*')
+						.filter(
+						name =>
+							!module.declarations[name].included &&
+							!module.declarations[name].reexported
+						);
+
+					if (unused.length === 0) return;
+
+					const names =
+						unused.length === 1
+							? `'${unused[0]}' is`
+							: `${unused
+								.slice(0, -1)
+								.map(name => `'${name}'`)
+								.join(', ')} and '${unused.slice(-1)}' are`;
+
+					this.warn({
+						code: 'UNUSED_EXTERNAL_IMPORT',
+						source: module.id,
+						names: unused,
+						message: `${names} imported from external module '${
+							module.id
+							}' but never used`
+					});
+				});
+
+				timeEnd('phase 3');
+
+				timeStart('phase 4');
+
+				// Phase 4 - we ensure that names are deconflicted throughout all bundles
+				//           then construct the bundles from the graph colouring for the chunks
+
+				// place all modules into their unique chunks
+				const chunks: { [entryPointsHash: string]: Chunk } = {};
+				for (let module of orderedModules) {
+					const entryPointsHashStr = module.entryPointsHash.toString('hex');
+					let curChunk = chunks[entryPointsHashStr];
+					if (curChunk) {
+						curChunk.modules.push(module);
+					}
+					else {
+						curChunk = chunks[entryPointsHashStr] = {
+							// non entry point chunks are named chunk-<hash>
+							fileName: 'chunk-' + entryPointsHashStr.substr(0, 8) + '.js',
+							bundle: undefined,
+							entryPoint: undefined,
+							exposedModules: [],
+							modules: [module]
+						};
+					}
+
+					// chunk will never have more than one entry point by graph colouring
+					if (module.isEntryPoint)
+						curChunk.entryPoint = module;
+
+					module.chunk = curChunk;
+				}
+
+				// run through all modules again and set exposedModules as the list
+				// of modules in a chunk that aren't an entryPoint but need to be available
+				// to another chunk through the fascade
+				// we could probably add exact export checking here to work out the exact exposed specifiers
+				for (let module of orderedModules) {
+					for (let depModule of module.dependencies) {
+						if (depModule.isEntryPoint)
+							continue;
+							if (depModule.chunk !== module.chunk) {
+								if (depModule.chunk.exposedModules.indexOf(depModule) === -1)
+									depModule.chunk.exposedModules.push(depModule);
+							}
+					}
+				}
+
+				const bundles: {
+					[name: string]: Bundle
+				} = {};
+
+				const entryChunkNames: string[] = [];
+				function generateUniqueEntryPointChunkName (id: string): string {
+					// entry point chunks are named by the entry point itself, with deduping
+					let entryName = path.basename(id);
+					let ext = path.extname(entryName);
+					entryName = entryName.substr(0, entryName.length - ext.length);
+					if (ext !== '.js' && ext !== '.mjs')
+						ext = '.js';
+					let uniqueEntryName = entryName;
+					let uniqueIndex = 1;
+					while (entryChunkNames.indexOf(uniqueEntryName) !== -1)
+						uniqueEntryName = entryName + ++uniqueIndex + ext;
+					return uniqueEntryName + ext;
+				}
+
+				Object.keys(chunks).forEach(chunkName => {
+					const chunk = chunks[chunkName];
+
+					let chunkEntry = <Module | ChunkFascadeModule>chunk.entryPoint;
+
+					// if the chunk exposes modules other than the entry point
+					// then it is an actual chunk with a hidden export interface that users should never directly see
+					// we export all exposed module exports through this interface, to then be used by the entry points
+					if (chunk.exposedModules.length) {
+						const fascadeReexports: { exportNames: string[], source: string }[] = [];
+						for (let module of chunk.exposedModules) {
+							// TODO: filter to exact exposed specifiers instead of all specifiers
+							const exportNames = module.getExports()
+								.map(exportName => module.traceExport(exportName))
+								.filter(expt => expt.included)
+								.map(expt => expt.getName());
+
+							fascadeReexports.push({ exportNames, source: './' + module.id });
+						}
+						chunkEntry = new ChunkFascadeModule('chunk-' + chunkName, fascadeReexports);
+					}
+					// otherwise a direct entry point chunk (true by graph colouring)
+					else {
+						chunk.fileName = generateUniqueEntryPointChunkName((<Module>chunk.entryPoint).id);
+					}
+
+					// sort chunk modules by execution order
+					const chunkModulesOrdered = chunk.modules.sort((moduleA, moduleB) => moduleA.execIndex > moduleB.execIndex ? 1 : -1);
+
+					// The external modules of a chunk are firstly the referenced modules in other chunks
+					// in correct execution order, followed by the external modules referenced from this chunk.
+					const depsFromOtherChunks: { execIndex: number, externalModule: ExternalModule }[] = [];
+					const actualExternals: ExternalModule[] = [];
+
+					for (let module of chunkModulesOrdered) {
+						// for each depModule of a module in this chunk that is not in the same chunk
+						for (let depModule of module.dependencies) {
+							if (chunkModulesOrdered.indexOf(depModule) !== -1)
+								continue;
+
+							// create an external module entry for the depModule and
+							// trace the used imports of the external module
+							// (not very efficient looping, should be a better module reference structuring here)
+							const execIndex = orderedModules.indexOf(depModule);
+							const externalModule = new ExternalModule('./' + depModule.chunk.fileName);
+							Object.keys(module.imports).forEach(importName => {
+								const impt = module.imports[importName];
+								if (impt.module !== depModule)
+									return;
+								const exportVariable = <ExternalVariable>externalModule.traceExport(impt.name);
+								exportVariable.includeVariable();
+								exportVariable.setSafeName(impt.name);
+							});
+							depsFromOtherChunks.push({ execIndex, externalModule });
+						}
+
+						// also determine actual externals of the chunk module
+						// NB we may end up importing more names than necessary here, as we import
+						// names over the whole tree against this external, wheres this can be filtered
+						// to just the names used by this chunk, minor though
+						Object.keys(module.imports).forEach(importName => {
+							const impt = module.imports[importName];
+							if (impt.module.isExternal) {
+								// prune unused external imports
+								if (!impt.module.used && this.isPureExternalModule(impt.module.id))
+									return;
+								if (actualExternals.indexOf(impt.module) === -1)
+									actualExternals.push(impt.module);
+							}
+						});
+					}
+
+					const chunkModuleExternals = depsFromOtherChunks
+						.sort((a, b) => a.execIndex > b.execIndex ? 1 : -1)
+						.map(item => item.externalModule).concat(actualExternals);
+
+					const bundle = new Bundle(this, chunkModulesOrdered, chunkModuleExternals, chunkEntry);
+					chunk.bundle = bundle;
+					bundle.deconflict();
+					bundles[chunk.fileName] = bundle;
+				});
+
+				// construct entry point fascade chunks
+				// these are chunks that contain both an entry point and exposed inner modules to other chunks
+				// for interface consistency, we can't expose those other exports to users so we create
+				// a special fascade for the entry point that just reexports everything from the chunk
+				Object.keys(chunks).forEach(chunkName => {
+					const chunk = chunks[chunkName];
+					if (chunk.exposedModules.length && chunk.entryPoint) {
+						const fileName = generateUniqueEntryPointChunkName(chunk.entryPoint.id);
+						const module = <Module>chunk.entryPoint;
+						const exportNames = module.getExports()
+							.map(exportName => module.traceExport(exportName))
+							.filter(expt => expt.included)
+							.map(expt => expt.getName());
+						const entryPointFascade = new ChunkFascadeModule(fileName, [{ exportNames, source: './' + fileName }]);
+						bundles[fileName] = new Bundle(this, [], [], entryPointFascade);
+					}
+				});
+
+				timeEnd('phase 4');
+
+				return bundles;
 			});
 	}
 
@@ -341,42 +582,67 @@ export default class Graph {
 		}
 	}
 
-	private analyseExecution (entryModule: Module) {
-		let hasCycles = false, curEntry: Module;
-		const seen: { [id: string]: Module } = {};
+	private analyseExecution (entryModules: Module[]) {
+		let hasCycles = false, curEntry: Module, curEntryHash: Buffer;
+		const entrySeen: { [id: string]: boolean } = {};
+		const allSeen: { [id: string]: boolean } = {};
 		const ordered: Module[] = [];
 
 		const dynamicImports: Module[] = [];
 
-		function visit (module: Module) {
-			const seenEntry = seen[module.id];
-			if (seenEntry) {
-				if (seenEntry === curEntry)
-					hasCycles = true;
+		function visit (module: Module, seen: { [id: string]: boolean } = {}) {
+			if (seen[module.id]) {
+				hasCycles = true;
 				return;
 			}
+			seen[module.id] = true;
 
-			seen[module.id] = curEntry;
+			// stop on entry points we've already top-level visited before
+			// also note the
+			if (module.isEntryPoint) {
+				if (entrySeen[module.id])
+					return;
+				entrySeen[module.id] = true;
+			}
 
-			module.dependencies.forEach(visit);
+			// Track entry point graph colouring by tracing all modules loaded by a given
+			// entry point and colouring those modules by the hash of its id. Colours are mixed as
+			// hash xors, providing the unique colouring of the graph into unique hash chunks.
+			// This is really all there is to automated chunking, the rest is chunk wiring.
+			if (module.entryPointsHash)
+				module.entryPointsHash = xor(module.entryPointsHash, curEntryHash);
+			else
+				module.entryPointsHash = curEntryHash;
+
+			module.dependencies.forEach(depModule => visit(depModule, seen));
+
 			module.dynamicImportResolutions.forEach(module => {
 				if (module instanceof Module)
 					dynamicImports.push(module);
 			});
 
+			if (allSeen[module.id])
+				return;
+			allSeen[module.id] = true;
+
+			module.execIndex = ordered.length;
 			ordered.push(module);
 		}
 
-		curEntry = entryModule;
-		visit(entryModule);
+		for (curEntry of entryModules) {
+			curEntry.isEntryPoint = true;
+			curEntryHash = crypto.createHash('md5').update(curEntry.id).digest();
+			visit(curEntry);
+		}
 
-		for (let i = 0; i < dynamicImports.length; i++) {
-			curEntry = dynamicImports[i];
+		for (curEntry of dynamicImports) {
+			curEntry.isEntryPoint = true;
+			curEntryHash = crypto.createHash('md5').update(curEntry.id).digest();
 			visit(curEntry);
 		}
 
 		if (hasCycles) {
-			this.warnCycle(ordered, [entryModule]);
+			this.warnCycle(ordered, entryModules);
 		}
 
 		return { orderedModules: ordered, dynamicImports };

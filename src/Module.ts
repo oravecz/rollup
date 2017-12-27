@@ -18,7 +18,7 @@ import ModuleScope from './ast/scopes/ModuleScope';
 import { encode } from 'sourcemap-codec';
 import { RawSourceMap, SourceMapConsumer } from 'source-map';
 import ImportSpecifier from './ast/nodes/ImportSpecifier';
-import Graph from './Graph';
+import Graph, { Chunk } from './Graph';
 import Variable from './ast/variables/Variable';
 import Program from './ast/nodes/Program';
 import VariableDeclarator from './ast/nodes/VariableDeclarator';
@@ -73,7 +73,7 @@ export interface ModuleJSON {
 	dependencies: string[];
 	code: string;
 	originalCode: string;
-	originalSourcemap: RawSourceMap;
+	originalSourcemap: RawSourceMap | void;
 	ast: Program;
 	sourcemapChain: RawSourceMap[];
 	resolvedIds: IdMap;
@@ -93,6 +93,8 @@ export default class Module {
 	exportAllSources: string[];
 	id: string;
 
+	isEntryPoint: boolean;
+
 	imports: {
 		[name: string]: {
 			source: string;
@@ -104,7 +106,7 @@ export default class Module {
 	isExternal: false;
 	magicString: MagicString;
 	originalCode: string;
-	originalSourcemap: RawSourceMap;
+	originalSourcemap: RawSourceMap | void;
 	reexports: { [name: string]: ReexportDescription };
 	resolvedExternalIds: IdMap;
 	resolvedIds: IdMap;
@@ -114,6 +116,9 @@ export default class Module {
 	strongDependencies: (Module | ExternalModule)[];
 	dynamicImports: Import[];
 	dynamicImportResolutions: (Module | ExternalModule | string | void)[];
+	// a hash representing which graph entry points load this module
+	entryPointsHash: Buffer;
+	execIndex: number;
 
 	ast: Program;
 	private astClone: Program;
@@ -121,7 +126,9 @@ export default class Module {
 		'*'?: NamespaceVariable;
 		[name: string]: Variable;
 	};
-	private exportAllModules: (Module | ExternalModule)[];
+	exportAllModules: (Module | ExternalModule)[];
+
+	chunk: Chunk;
 
 	constructor ({
 		id,
@@ -137,8 +144,8 @@ export default class Module {
 			id: string,
 			code: string,
 			originalCode: string,
-			originalSourcemap: RawSourceMap,
-			ast: Program,
+			originalSourcemap: RawSourceMap | void,
+			ast: Program | void,
 			sourcemapChain: RawSourceMap[],
 			resolvedIds: IdMap,
 			resolvedExternalIds?: IdMap,
@@ -153,6 +160,10 @@ export default class Module {
 		this.comments = [];
 		this.dynamicImports = [];
 		this.dynamicImportResolutions = [];
+		this.isEntryPoint = false;
+		this.entryPointsHash = undefined;
+		this.execIndex = undefined;
+		this.chunk = undefined;
 
 		timeStart('ast');
 

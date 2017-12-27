@@ -26,7 +26,7 @@ export default function es (bundle: Bundle, magicString: MagicStringBundle, { ge
 						return `* as ${module.name}`;
 					}
 
-					const declaration = <ExternalVariable> module.declarations[name];
+					const declaration = module.declarations[name];
 
 					if (declaration.name === declaration.safeName)
 						return declaration.name;
