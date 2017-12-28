@@ -130,6 +130,7 @@ export default function mergeOptions ({
 		paths: getOutputOption('paths'),
 		exports: getOutputOption('exports'),
 		file: getOutputOption('file'),
+		dir: getOutputOption('dir')
 	};
 
 	let mergedOutputOptions;

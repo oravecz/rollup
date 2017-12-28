@@ -9,6 +9,7 @@ describe( 'rollup', function () {
 	after( () => console.timeEnd( 'Total test time' ) );
 
 	require( './misc/index.js' );
+	require( './chunking-form/index.js' );
 	require( './function/index.js' );
 	require( './form/index.js' );
 	require( './sourcemaps/index.js' );

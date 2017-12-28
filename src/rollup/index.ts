@@ -226,11 +226,15 @@ export default function rollup (rawInputOptions: GenericConfigObject) {
 
 		timeStart('--BUILD--');
 
-		const codeSplitting = inputOptions.input instanceof Array;
+		const codeSplitting = inputOptions.experimentalCodeSplitting;
 
-		if (codeSplitting && !inputOptions.experimentalCodeSplitting) {
+		if (codeSplitting) {
+			if (typeof inputOptions.input === 'string')
+				inputOptions.input = [inputOptions.input];
+		}
+		else if (inputOptions.input instanceof Array && !codeSplitting) {
 			error({
-				code: 'MISSING_OPTION',
+				code: 'INVALID_OPTION',
 				message: 'Multiple inputs only supported when setting the experimentalCodeSplitting flag option.'
 			});
 		}
@@ -358,6 +362,13 @@ export default function rollup (rawInputOptions: GenericConfigObject) {
 
 				function generate (rawOutputOptions: GenericConfigObject) {
 					const outputOptions = getAndCheckOutputOptions(inputOptions, rawOutputOptions);
+
+					if (outputOptions.format === 'umd' || outputOptions.format === 'iife') {
+						error({
+							code: 'INVALID_OPTION',
+							message: 'UMD and IIFE output formats are not supported with the experimentalCodeSplitting option.'
+						});
+					}
 
 					timeStart('--GENERATE--');
 
